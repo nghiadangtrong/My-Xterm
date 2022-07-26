@@ -2,6 +2,9 @@ import { Server as NetServer, Socket as NetSocket } from 'net';
 import { NextApiRequest, NextApiResponse } from 'next';
 import { Server as ServerIO, Socket } from 'socket.io';
 import { Client as SSH, ConnectConfig as ConnectConfigSSH } from 'ssh2';
+import fs from 'fs';
+
+import CorsMiddleware from 'middleware/cors';
 
 type NextApiResponseServerIO = NextApiResponse & {
   socket: NetSocket & {
@@ -11,106 +14,143 @@ type NextApiResponseServerIO = NextApiResponse & {
 
 const DataHOST: Array<{host: string, connectConfig: ConnectConfigSSH}> = [
   {
-    host: '192.x.x.x.x',
+    host: '192.168.6.84',
     connectConfig: {
-      host: '192.168.x.x',
+      host: '192.168.6.84',
       port: 22,
-      username: 'user',
-      password: 'password'
+      username: 'xx',
+      password: 'xxx',
+      // passphrase: 'xxxxx',
+      // privateKey: fs.readFileSync('/home/user/.ssh/id_rsa')
     } 
-  }
+  },
 ]
 
-const getHost = (host: string): {host: string, connectConfig: ConnectConfigSSH} | undefined => DataHOST.find(item => item.host === host); 
+const getHost = async (host: string): Promise<{host: string, connectConfig: ConnectConfigSSH} | undefined>=> {
+  // return undefined
+  return DataHOST[0];
+  return DataHOST.find(item => item.host === host); 
+}
 
-const sshConnects: {[key: string]: { clientSSH?: { end: ()=>any, isConnect: boolean }, connectConfigSSH?: ConnectConfigSSH }} = {};
+type SshStatus = 'signingIn' | 'signedIn' | 'signOut' | 'error';
 
-const getClientSSH = (socket: Socket, connectConfig: ConnectConfigSSH, configView: { term: string, cols: string, rows: string}): { end: ()=>any, isConnect: boolean } => {
-  let isConnect: boolean = false; 
-  let connectSSH = new SSH();
-  
-  connectSSH.on('banner', (data) => {
-    console.log('[CON-SSH-BANNEL]: ', data);
-    socket.emit('ssh-data', data.replace(/\r?\n/g, '\r\n').toString());
-  });
+const getClientSSH = async (socket: Socket, configView: { host: string, term: string, cols: string, rows: string})
+: Promise<{ end: ()=>any } | null | undefined > => {
 
-  connectSSH.on('ready', () => {
-    console.log('[CON-SSH-READY]: ');
-    console.log(
-      `LOGIN user=${connectConfig.username} from=${socket.handshake.address} host=${connectConfig.host}:${connectConfig.port}`
-    )
-    isConnect = true;
-    let { term, cols, rows }: any = configView;
-    connectSSH.shell({term, cols, rows }, (err, stream) => {
-      if (err) {
-        console.log('[CON-SSH-READY-ERROR]', err);
-        connectSSH.end();
-        socket.disconnect(true);
-      }
+  let sshStatus: SshStatus; 
+  let connectSSH:SSH;
+  connectSSH = new SSH();
 
-      socket.on('ssh-resize', (data: { rows: string, cols: string, height: string,  width: string }) => {
-        console.log('[SSH-RESIZE]: ', data)
-        stream.setWindow(data.rows, data.cols, data.height, data.width);
-      })
-
-      socket.on('ssh-data', (data) => {
-        console.log(['Client-SEND-TO-SEVER][SSH-DATA'], data);
-        stream.write(data);
-      })
-
-      stream.on('data', (data: any) => {
-        console.log('[STREAM-SSH-DATA]', data)
-        socket.emit('ssh-data', data.toString());
-      })
-
-      stream.on('close', (code: any, signal: any) => {
-        console.log('[STREAM-CLOSE]: ', { code, signal });
-        isConnect= false;
-        socket.disconnect(true);
-        connectSSH.end();
-      })
-
-      stream.stderr.on('data', (data) => {
-        console.log('[STREAM-STDERR]: ', data)
-      })
-      
-    })
-  })
-
-  connectSSH.on('end', () => {
-    console.log('[CON-SSH-END]: ');
-    socket.disconnect(true);
-    isConnect = false;
-  })
-
-  connectSSH.on('close', () => {
-    console.log('[CON-SSH-CLOSE]: ');
-    socket.disconnect(true);
-    isConnect = false;
-  })
-
-  connectSSH.on('error', (error) => {
-    console.log('[CON-SSH-CLOSE]: ', error);
-    isConnect = false;
-  })
-  connectSSH.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
-    console.log('[CON-SSH-keyboard-interactive]');
-    if (connectConfig.username) {
-      finish([connectConfig.username]);
+  try {
+    const hostConfig = await getHost(configView.host);
+    console.log('[+] find host config: ', hostConfig)
+    if (!hostConfig) {
+      console.log('[-] Not Found host')
+      throw new Error('Not Found Host')
     }
-  });
 
-  connectSSH.connect(connectConfig);
+    const connectConfig: ConnectConfigSSH = {
+      ...defaultConnectConfigSSH,
+      ...hostConfig.connectConfig,
+    }
+
+    connectSSH.on('banner', (data) => {
+      console.log('[SSH-BANNEL]: ', data);
+      socket.emit('ssh-data', data.replace(/\r?\n/g, '\r\n').toString());
+    });
+
+    connectSSH.on('ready', () => {
+      sshStatus = 'signingIn';
+
+      console.log('[ssh-connect-success] ')
+      socket.emit('ssh-connect-success', { connectId: socket.id })
+
+      console.log(
+        `[SSH-READY] [signedIn] user=${connectConfig.username} from=${socket.handshake.address} host=${connectConfig.host}:${connectConfig.port}`
+      )
+
+      let { term, cols, rows }: any = configView;
+      connectSSH.shell({term, cols, rows }, (err, stream) => {
+        if (err) {
+          console.log('[CON-SSH-READY-ERROR]', err);
+
+          sshStatus = 'error';
+          connectSSH.end();
+          socket.disconnect(true);
+          return;
+        }
+
+        socket.on('ssh-resize', (data: { rows: string, cols: string, height: string,  width: string }) => {
+          console.log('[client-resize] Client send resize to ssh ', data)
+          stream.setWindow(data.rows, data.cols, data.height, data.width);
+        });
+
+        socket.on('ssh-data', (data) => {
+          console.log('[client-send-data] Client send data to ssh', data);
+          stream.write(data);
+        })
+
+        stream.on('data', (data: any) => {
+          console.log('[ssh-send-data] SSH send data to client', data)
+          socket.emit('ssh-data', data.toString());
+        })
+
+        stream.on('close', (code: any, signal: any) => {
+          console.log('[STREAM-CLOSE]: ', { code, signal });
+          sshStatus= 'signOut';
+          socket.disconnect(true);
+          connectSSH.end();
+        })
+
+        stream.stderr.on('data', (data) => {
+          console.log('[ssh-stream-error]: STREAM-STDERR', data);
+        })
+        
+      })
+    })
+
+    connectSSH.on('end', () => {
+      console.log('[ssh-end]: ');
+      sshStatus = 'signOut';
+      socket.disconnect(true);
+    })
+
+    connectSSH.on('close', () => {
+      console.log('[ssh-close]: ');
+      sshStatus = 'signOut';
+      socket.disconnect(true);
+    })
+
+    connectSSH.on('error', (error) => {
+      console.log('[ssh-error]: ', error);
+      sshStatus = 'error';
+      socket.emit('ssh-error', { connectId: socket.id, error });
+    })
+
+    connectSSH.on('keyboard-interactive', (_name, _instructions, _instructionsLang, _prompts, finish) => {
+      console.log('[keyboard-interactive]');
+      if (connectConfig.username) {
+        finish([connectConfig.username]);
+      }
+    });
+
+
+    console.log('[+] Start connect to SSH: ', connectConfig.host)
+    connectSSH.connect(connectConfig);
+  } catch (e: any) {
+    socket.emit('ssh-error', { error: e?.message });
+    return 
+  }
 
   return {
     end: () => {
-      if (isConnect) {
+      if (sshStatus) {
         connectSSH.end();
-        isConnect = false;
+        sshStatus = 'signOut';
       }
-    },
-    isConnect: isConnect  
-  };
+    }
+  }
+  
 }
 
 const defaultConnectConfigSSH : ConnectConfigSSH= {
@@ -140,72 +180,36 @@ const defaultConnectConfigSSH : ConnectConfigSSH= {
   port: 22
 }
 
-const socketio = (req: NextApiRequest, res: NextApiResponseServerIO) => {
+const socketio = async (req: NextApiRequest, res: NextApiResponseServerIO) => {
+  await CorsMiddleware(req, res);
+
   if (!res?.socket?.server?.io) {
     const httpServer = res.socket.server as any;
     const io = new ServerIO(httpServer, {
-      path: '/api/socketio'
+      path: '/api/socketio',
+      cors: {
+        origin: ["http://localhost:4300"],
+        credentials: true
+      }
     })
 
     io.on('connect', socket => {
 
+      let connectSSH: any;
+
       socket.on('ssh-connect', async (config: {host: string, term: string, rows: string, cols: string }) => {
         const {host, term, rows, cols } = config;
-        // handle connect ssh
-        const hostObject = getHost(host);
 
-        if (hostObject) {
-          const connectConfigSSH: ConnectConfigSSH = {
-            ...defaultConnectConfigSSH,
-            ...hostObject.connectConfig,
-          }
-          console.log('[ssh-connect]: ')
-          console.log({  hostObject, config })
-            let clientSSH = getClientSSH(socket, connectConfigSSH, { term, cols, rows });
-            let _interval = setInterval(() => {
-              if (clientSSH.isConnect) {
-                console.log('[Check-Interval-conenctSSH] ')
-                sshConnects[socket.id] = { clientSSH , connectConfigSSH };
-                socket.emit('ssh-connect-success', { connectId: socket.id })
-                clearInterval(_interval);
-              }
-            }, 1000)
-        } else {
-          sshConnects[socket.id] = { clientSSH: undefined, connectConfigSSH: undefined };
-          socket.emit('ssh-connect-false', { connectId: socket.id });
-        }
+        console.log('[make-client-ssh]: ');
+        connectSSH = getClientSSH(socket, { host, term, cols, rows })
+
       })
-
-      socket.on('ssh-disconnect', async () => {
-        console.log('[SOCK-SSH-DISCONNECT]: ')
-        if (!sshConnects[socket.id]) {
-          socket.disconnect(true);
-          return;
-        }
-        // handle disconnect ssh
-        sshConnects[socket.id]?.clientSSH?.end();
-      })
-
-      socket.on('error', (err) => {
-        console.log('[SOCK-ERROR]: ', err)
-        if (!sshConnects[socket.id]) {
-          socket.disconnect(true);
-          return;
-        }
-
-        sshConnects[socket.id]?.clientSSH?.end();
-        delete sshConnects[socket.id];
-      });
 
       socket.on('disconnect', async () => {
-        console.log('[SOCK-DISCONNECT]: ')
-        if (!sshConnects[socket.id]) {
-          socket.disconnect(true);
-          return;
+        console.log('[Socket-Disconnect]')
+        if (connectSSH?.end) {
+          connectSSH.end();
         }
-
-        sshConnects[socket.id]?.clientSSH?.end();
-        delete sshConnects[socket.id];
       })
       
     })
@@ -218,7 +222,8 @@ const socketio = (req: NextApiRequest, res: NextApiResponseServerIO) => {
 
 export const config = {
   api: {
-    bodyParse: false
+    bodyParse: false,
+    origin: "http://localhost:4300"
   }
 }
 
